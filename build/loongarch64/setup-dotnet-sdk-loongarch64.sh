@@ -1,59 +1,130 @@
 #!/usr/bin/env bash
 # =============================================================================
-# 在 loongarch64（龙芯）上准备 .NET 10 SDK
+# 在 loongarch64（龙芯）上准备 .NET 10 SDK —— LoongArch psABI v2.0（ABI2）适配版
 #
-# 背景：微软官方从未发布 linux-loongarch64 的 .NET SDK（仅有运行时），
-#       因此这里用「上游 x64 SDK 载荷 + Loongnix 官方 loongarch64 运行时」
-#       组装出一套可用的 .NET 10 SDK：
-#         1) 下载上游 dotnet-sdk-10.0.403-linux-x64.tar.gz 的托管载荷
-#         2) 从 Loongnix NuGet 源取 microsoft.netcore.app.{runtime,host}.linux-loongarch64
-#         3) 替换 muxer / hostfxr / shared framework / apphost 模板
-#         4) 把 SDK 内 x64 的 R2R 程序集标记改写为 loongarch64（CLR 回退到 IL 执行）
-#         5) 把 4 个 x86_64 单文件 bundle 启动器换成 shell 包装器
+# 背景：
+#   1) 微软官方从未发布 linux-loongarch64 的 .NET SDK（仅有运行时），
+#      因此这里用「上游 x64 SDK 载荷 + Loongnix 官方 loongarch64 运行时」
+#      组装出一套可用的 .NET 10 SDK；
+#   2) 本机是 Loongnix 25 / glibc 2.41 / gcc 14，属于 **LoongArch ABI 2.0**
+#      系统（ELF e_flags 带 OBJ-v1 标记 = 0x40）。Loongnix NuGet 源提供的
+#      loongarch64 运行时是 ABI 1.0 构建（e_flags 0x3 / OBJ-v0）；
+#      ABI2 内核与 glibc 对 ABI1 二进制保持向后兼容，实测可直接运行。
+#      但 **本机没有系统 dotnet**，所以 muxer（`dotnet` 宿主）也要从
+#      NuGet 的 runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost 取。
+#
+# 步骤：
+#   0) 探测本机 ABI，打印 e_flags（ABI2 期望 OBJ-v1）
+#   1) 下载上游 dotnet-sdk-<ver>-linux-x64.tar.gz 的托管载荷
+#   2) 从 Loongnix NuGet 源取 loongarch64 的
+#      microsoft.netcore.app.{runtime,host}.linux-loongarch64 与
+#      runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost
+#   3) 解包 SDK 载荷
+#   4) 组装：muxer / hostfxr / shared framework / apphost 模板
+#   5) 把 SDK 内 x64 的 R2R 程序集标记改写为 loongarch64（CLR 回退到 IL 执行）
+#   6) 把 4 个 x86_64 单文件 bundle 启动器换成 shell 包装器
 #
 # 用法： bash setup-dotnet-sdk-loongarch64.sh [安装目录(默认 ~/.dotnet10)]
+#
+# 可用环境变量覆盖：
+#   SDK_VER=10.0.403  RUNTIME_VER=10.0.14  MUXER_VER=8.0.34
+#   WORK=<下载缓存目录，默认 ~/.cache/sourcegit-abi2/work>
 # =============================================================================
 set -euo pipefail
 
 ROOT="${1:-$HOME/.dotnet10}"
-SDK_VER="10.0.403"
-RUNTIME_VER="10.0.14"
+SDK_VER="${SDK_VER:-10.0.403}"
+RUNTIME_VER="${RUNTIME_VER:-10.0.14}"
+# loongarch64 的独立 muxer 目前只发到 8.0.x；muxer 只负责定位 hostfxr，
+# 与运行时大版本无关（本机实测 8.0.34 muxer + 10.0.14 hostfxr 可用）。
+MUXER_VER="${MUXER_VER:-8.0.34}"
 LOONG_NUGET="https://nuget.loongnix.cn/v3/package"
-WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+WORK="${WORK:-$HOME/.cache/sourcegit-abi2/work}"
 
-echo "==> 1/6 下载 .NET ${SDK_VER} SDK 载荷 (x64)"
-if [[ ! -f "$WORK/sdk.tar.gz" ]]; then
-  wget -q -O "$WORK/sdk.tar.gz" \
-    "https://builds.dotnet.microsoft.com/dotnet/Sdk/${SDK_VER}/dotnet-sdk-${SDK_VER}-linux-x64.tar.gz"
+SDK_URLS=(
+  "https://builds.dotnet.microsoft.com/dotnet/Sdk/${SDK_VER}/dotnet-sdk-${SDK_VER}-linux-x64.tar.gz"
+  "https://dotnetcli.blob.core.windows.net/dotnet/Sdk/${SDK_VER}/dotnet-sdk-${SDK_VER}-linux-x64.tar.gz"
+)
+
+get() {  # get <url> <out>：下载到 .part 再改名，避免中断留下半截缓存
+  local url="$1" out="$2"
+  [[ -s "$out" ]] && return 0
+  echo "    下载 $(basename "$out")"
+  wget -q -O "$out.part" "$url" && mv -f "$out.part" "$out"
+}
+
+mkdir -p "$WORK"
+
+echo "==> 0/6 探测本机 ABI"
+HOST_FLAGS="$(readelf -h /bin/ls 2>/dev/null | sed -n 's/.*0x\([0-9a-f]*\),.*/\1/p' | head -1)"
+if [[ -n "${HOST_FLAGS:-}" ]]; then
+  printf '    /bin/ls e_flags = 0x%s' "$HOST_FLAGS"
+  if (( (16#$HOST_FLAGS) & 0x40 )); then
+    echo "  (OBJ-v1 → 本机为 LoongArch ABI 2.0)"
+  else
+    echo "  (OBJ-v0 → 本机为 LoongArch ABI 1.0)"
+  fi
+else
+  echo "    无法读取 e_flags（缺 readelf？）"
 fi
 
-echo "==> 2/6 下载 loongarch64 运行时与宿主包"
-for p in microsoft.netcore.app.runtime.linux-loongarch64 microsoft.netcore.app.host.linux-loongarch64; do
-  wget -q -O "$WORK/$p.nupkg" "$LOONG_NUGET/$p/$RUNTIME_VER/$p.$RUNTIME_VER.nupkg"
-done
+echo "==> 1/6 下载 .NET ${SDK_VER} SDK 载荷 (x64)"
+if [[ ! -s "$WORK/sdk.tar.gz" ]]; then
+  for u in "${SDK_URLS[@]}"; do
+    if wget -q -O "$WORK/sdk.tar.gz.part" "$u"; then
+      mv -f "$WORK/sdk.tar.gz.part" "$WORK/sdk.tar.gz"
+      break
+    fi
+    rm -f "$WORK/sdk.tar.gz.part"
+  done
+fi
+[[ -s "$WORK/sdk.tar.gz" ]] || { echo "下载 SDK 载荷失败" >&2; exit 1; }
+
+echo "==> 2/6 下载 loongarch64 运行时 / 宿主包"
+get "$LOONG_NUGET/microsoft.netcore.app.runtime.linux-loongarch64/$RUNTIME_VER/microsoft.netcore.app.runtime.linux-loongarch64.$RUNTIME_VER.nupkg" \
+    "$WORK/microsoft.netcore.app.runtime.linux-loongarch64.nupkg"
+get "$LOONG_NUGET/microsoft.netcore.app.host.linux-loongarch64/$RUNTIME_VER/microsoft.netcore.app.host.linux-loongarch64.$RUNTIME_VER.nupkg" \
+    "$WORK/microsoft.netcore.app.host.linux-loongarch64.nupkg"
+get "$LOONG_NUGET/runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost/$MUXER_VER/runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost.$MUXER_VER.nupkg" \
+    "$WORK/runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost.nupkg"
+
 python3 - "$WORK" <<'PY'
 import sys, zipfile, os
 w = sys.argv[1]
 for name in ("microsoft.netcore.app.runtime.linux-loongarch64",
-             "microsoft.netcore.app.host.linux-loongarch64"):
-    zipfile.ZipFile(os.path.join(w, name + ".nupkg")).extractall(os.path.join(w, name))
+             "microsoft.netcore.app.host.linux-loongarch64",
+             "runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost"):
+    dst = os.path.join(w, name)
+    if os.path.isdir(dst) and os.listdir(dst):
+        continue
+    zipfile.ZipFile(os.path.join(w, name + ".nupkg")).extractall(dst)
 PY
 
 echo "==> 3/6 解包 SDK 载荷"
+rm -rf "$WORK/sdk"
 mkdir -p "$WORK/sdk" && tar -xzf "$WORK/sdk.tar.gz" -C "$WORK/sdk"
 
 echo "==> 4/6 组装 $ROOT"
 rm -rf "$ROOT"
 cp -a "$WORK/sdk/." "$ROOT/"
-cp -f /usr/share/dotnet/dotnet "$ROOT/dotnet"                      # loongarch64 muxer
+# muxer：优先用 NuGet 里的 loongarch64 版（本机没有系统 dotnet）；
+# 若系统 /usr/share/dotnet/dotnet 存在（Loongnix 20 这类旧机器）则沿用系统版。
+if [[ -f "$WORK/runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost/runtimes/linux-loongarch64/native/dotnet" ]]; then
+  cp -f "$WORK/runtime.linux-loongarch64.Microsoft.NETCore.DotNetHost/runtimes/linux-loongarch64/native/dotnet" "$ROOT/dotnet"
+elif [[ -f /usr/share/dotnet/dotnet ]]; then
+  cp -f /usr/share/dotnet/dotnet "$ROOT/dotnet"
+else
+  echo "找不到 loongarch64 muxer（NuGet DotNetHost 与系统 dotnet 均不存在）" >&2
+  exit 1
+fi
+NET_TFM="net${RUNTIME_VER%.*}"
 rm -rf "$ROOT/host/fxr"
 mkdir -p "$ROOT/host/fxr/$RUNTIME_VER"
 cp "$WORK/microsoft.netcore.app.runtime.linux-loongarch64/runtimes/linux-loongarch64/native/libhostfxr.so" \
    "$ROOT/host/fxr/$RUNTIME_VER/libhostfxr.so"
 rm -rf "$ROOT/shared/Microsoft.NETCore.App"
 mkdir -p "$ROOT/shared/Microsoft.NETCore.App/$RUNTIME_VER"
-cp -a "$WORK/microsoft.netcore.app.runtime.linux-loongarch64/runtimes/linux-loongarch64/lib/net$RUNTIME_VER/." \
+cp -a "$WORK/microsoft.netcore.app.runtime.linux-loongarch64/runtimes/linux-loongarch64/lib/$NET_TFM/." \
       "$ROOT/shared/Microsoft.NETCore.App/$RUNTIME_VER/"
 cp -a "$WORK/microsoft.netcore.app.runtime.linux-loongarch64/runtimes/linux-loongarch64/native/." \
       "$ROOT/shared/Microsoft.NETCore.App/$RUNTIME_VER/"

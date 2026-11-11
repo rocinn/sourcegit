@@ -3,6 +3,12 @@
 # 构建 SourceGit 的 loongarch64（龙芯）本机版本
 #
 # 前提：已执行 setup-dotnet-sdk-loongarch64.sh 生成 ~/.dotnet10
+#       NuGet 源需按 README 的「NuGet 配置」一节设置（loongnix + 源映射），
+#       否则 SkiaSharp/HarfBuzz 的 loongarch64 原生库会被解析成无原生库的版本。
+#
+# 注意：子模块 depends/AvaloniaEdit 自带会 <clear/> 包源的 NuGet.config，
+#       首次构建可能在子模块项目上报 NU1101（找不到 loongarch64 运行时包）。
+#       这是预期现象：主项目已把包灌进 ~/.nuget/packages，**重跑一次即可**。
 #
 # 用法： bash build-loongarch64.sh [仓库根目录]
 # =============================================================================
